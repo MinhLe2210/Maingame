@@ -1,65 +1,104 @@
-import requests
-import json
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+import asyncio
 import time
-import torch
+from openai import OpenAI
 
-# API URL
-url = "http://localhost:30080/completions"
+# Initialize FastAPI app
+app = FastAPI()
 
-# Request payload
-payload = {
-    "model": "meta-llama/Llama-3.1–8B-Instruct",
-    "prompt": "Once upon a time,",
-    "max_tokens": 100
-}
+# OpenAI-compatible client for vLLM
+openai_api_key = "EMPTY"
+openai_api_base = "http://localhost:8000/v1"
 
-# Measure memory usage before inference
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-    vram_before = torch.cuda.memory_allocated()
-else:
-    vram_before = None
+client = OpenAI(
+    api_key=openai_api_key,
+    base_url=openai_api_base,
+)
 
-# Send request and measure time to first token and throughput
-start_time = time.time()
-response = requests.post(url, headers={"Content-Type": "application/json"}, data=json.dumps(payload), stream=True)
+# Request model
+class PromptRequest(BaseModel):
+    prompts: List[str]
+    model: Optional[str] = "meta-llama/Llama-3.1–8B-Instruct"
+    max_tokens: int = 100
 
-# Time to first token
-first_token_time = None
-total_tokens = 0
-start_first_token = time.time()
+# Store results
+results = {}
 
-for line in response.iter_lines():
-    if line:
-        total_tokens += 1
-        if first_token_time is None:
-            first_token_time = time.time() - start_first_token
+# Function to handle a single completion request
+async def generate_completion(prompt, model, max_tokens):
+    start_time = time.time()
+    
+    completion = client.completions.create(
+        model=model,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        n=1,
+        stream=False
+    )
+    
+    first_token_time = time.time() - start_time
+    completion_time = time.time() - start_time
+    tokens_generated = completion.usage.completion_tokens
+    
+    throughput = tokens_generated / completion_time if completion_time > 0 else 0
+    
+    result = {
+        "prompt": prompt,
+        "completion": completion.choices[0].text.strip(),
+        "time_to_first_token": first_token_time,
+        "total_time": completion_time,
+        "throughput": throughput,
+        "tokens_generated": tokens_generated
+    }
+    
+    return result
 
-# Total completion time
-end_time = time.time()
-total_time = end_time - start_time
+# Function to handle batching
+async def handle_batch(prompts, model, max_tokens):
+    tasks = [
+        generate_completion(prompt, model, max_tokens)
+        for prompt in prompts
+    ]
+    
+    results = await asyncio.gather(*tasks)  # Run concurrently
+    return results
 
-# Throughput (tokens per second)
-throughput = total_tokens / total_time if total_time > 0 else 0
+# Endpoint to receive batch requests
+@app.post("/generate")
+async def generate(request: PromptRequest, background_tasks: BackgroundTasks):
+    if not request.prompts:
+        raise HTTPException(status_code=400, detail="Prompts cannot be empty.")
+    
+    # Use lambda to wrap the coroutine so it's callable
+    background_tasks.add_task(
+        lambda: asyncio.run(handle_batch(request.prompts, request.model, request.max_tokens))
+    )
+    
+    # Start the batch processing directly in the main event loop
+    output = await handle_batch(request.prompts, request.model, request.max_tokens)
+    
+    # Save the result
+    request_id = str(time.time())
+    results[request_id] = output
+    
+    return {
+        "request_id": request_id,
+        "status": "completed",
+        "results": output
+    }
 
-# Measure VRAM usage after inference
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-    vram_after = torch.cuda.memory_allocated()
-    vram_used = vram_after - vram_before
-else:
-    vram_used = None
 
-# Report metrics
-metrics = {
-    "Time to First Token (s)": first_token_time,
-    "Total Tokens Generated": total_tokens,
-    "Total Time (s)": total_time,
-    "Throughput (tokens/sec)": throughput,
-    "VRAM Used (bytes)": vram_used if vram_used is not None else "N/A"
-}
+# Endpoint to retrieve results by request ID
+@app.get("/results/{request_id}")
+async def get_results(request_id: str):
+    if request_id not in results:
+        raise HTTPException(status_code=404, detail="Request ID not found.")
+    
+    return results[request_id]
 
-# Print the report
-print("\n=== Model Performance Report ===")
-for key, value in metrics.items():
-    print(f"{key}: {value}")
+# Start server
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8123)
