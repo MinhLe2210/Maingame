@@ -1,7 +1,7 @@
 servingEngineSpec:
   runtimeClassName: ""
   modelSpec:
-  - name: "llama3"
+  - name: "bloomz"
     repository: "vllm/vllm-openai"
     tag: "latest"
     modelURL: "meta-llama/Llama-3.1-8B-Instruct"
