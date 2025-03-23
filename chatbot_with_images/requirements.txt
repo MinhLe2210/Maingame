@@ -29,3 +29,5 @@ opencv-python-headless
 faiss-cpu
 streamlit
 groq
+ipykernel
+requests
